@@ -1,5 +1,5 @@
 import { OPENCODE_API_URL, opencodeHeaders } from "./config.ts";
-import { ensureChatFingerprintTools } from "./opencode-fingerprint.ts";
+import { enforceOpencodeFingerprint } from "./opencode-fingerprint.ts";
 
 /**
  * Relay reachability probe: verifies a deployed relay answers requests
@@ -85,11 +85,13 @@ async function probeRelayOnce(
      stream: true,
      messages: [{ role: "user", content: "ping" }],
     };
-    ensureChatFingerprintTools(probePayload);
+    // The proxy's own enforcement, not a subset of it: a probe that skipped the
+    // env block would answer 429 for a lane that actually serves traffic.
+    enforceOpencodeFingerprint(probePayload, "/v1/chat/completions");
     body = JSON.stringify(probePayload);
-   } else {
+    } else {
     fetchUrl = `${OPENCODE_API_URL}/models`;
-   }
+    }
   } else {
    if (isChat) {
     fetchUrl = `${cleanUrl}/inference/v1/chat/completions`;
@@ -103,7 +105,7 @@ async function probeRelayOnce(
      stream: true,
      messages: [{ role: "user", content: "ping" }],
     };
-    ensureChatFingerprintTools(probePayload);
+    enforceOpencodeFingerprint(probePayload, "/v1/chat/completions");
     body = JSON.stringify(probePayload);
    } else {
     fetchUrl = `${cleanUrl}/v1/models`;

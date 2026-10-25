@@ -11,6 +11,13 @@
  * 3. Tools: must declare the placeholder sextet {bash, glob, grep, read, edit, write}
  * 4. Streaming: must be stream: true
  *
+ * A fifth axis lives in the body rather than the headers: the free tier refuses
+ * any request whose system prompt carries no complete `<env>` environment block,
+ * and it refuses with HTTP 429 FreeUsageLimitError — the same status and
+ * retry-after-to-00:00-UTC body as an exhausted quota, although the quota is
+ * untouched (issue #117/#118: same machine, same minute, 200 with the block and
+ * 429 without it). See ensureEnvBlock below.
+ *
  * This module ensures axes 3 and 4 are enforced on outgoing requests, and handles
  * bidirectional streaming conversion: if the client requested non-streaming
  * (stream: false), upstream is still sent stream: true to pass the gate, and the
@@ -491,6 +498,202 @@ export function normalizeResponsesBody(body: Record<string, unknown>): void {
  if (body.store === undefined) body.store = false;
 }
 
+/** Complete `<env>` … `</env>` pair; non-greedy so two blocks stay two matches. */
+const ENV_PAIR_RE = /<env>[\s\S]*?<\/env>/g;
+/** A tag whose partner is missing or was stripped: it can shadow the real pair. */
+const ENV_TAG_RE = /<\/?env>/g;
+/** The gate's load-bearing key. Any value passes; a different key does not. */
+const WORKING_DIRECTORY_RE = /Working directory:[ \t]*([^\n<]*)/;
+/** The gate reads the key, not a usable path: this block is a fingerprint. */
+const FALLBACK_WORKING_DIRECTORY = "(current project)";
+
+/** One mutable piece of system-prompt text: the only place a block can live. */
+type SystemText = { read(): string; write(text: string): void };
+
+/** `container[key]` as a mutable string segment. */
+function stringSegment(container: Record<string, unknown>, key: string): SystemText {
+ return {
+  read: () => (typeof container[key] === "string" ? (container[key] as string) : ""),
+  write: (text) => {
+   container[key] = text;
+  },
+ };
+}
+
+/** The text blocks of a parts array (`content[]` / Anthropic `system[]`). */
+function textBlockSegments(blocks: unknown[]): SystemText[] {
+ const segments: SystemText[] = [];
+ for (const block of blocks) {
+  if (!block || typeof block !== "object" || Array.isArray(block)) continue;
+  const rec = block as Record<string, unknown>;
+  if (typeof rec.text !== "string") continue;
+  segments.push({
+   read: () => rec.text as string,
+   write: (text) => {
+    rec.text = text;
+   },
+  });
+ }
+ return segments;
+}
+
+/**
+ * Text segments of a `content` field: a plain string, or the text blocks of a
+ * parts array (Chat Completions spells message content both ways). A parts
+ * array with no text block gains one, because there is nowhere else to append.
+ */
+function contentSegments(message: Record<string, unknown>): SystemText[] {
+ const content = message.content;
+ if (!Array.isArray(content)) {
+  if (typeof content !== "string") message.content = "";
+  return [stringSegment(message, "content")];
+ }
+ const segments = textBlockSegments(content);
+ if (segments.length > 0) return segments;
+ const block: Record<string, unknown> = { type: "text", text: "" };
+ content.push(block);
+ return [stringSegment(block, "text")];
+}
+
+/**
+ * Chat Completions system prompt: every `role: "system"` message in order.
+ * A body with none gains one at the top.
+ */
+function chatSystemSegments(body: Record<string, unknown>): SystemText[] {
+ const existing = body.messages;
+ if (existing !== undefined && !Array.isArray(existing)) return [];
+ const messages: unknown[] = Array.isArray(existing) ? existing : ((body.messages = []) as unknown[]);
+ const segments: SystemText[] = [];
+ for (const message of messages) {
+  if (!message || typeof message !== "object" || Array.isArray(message)) continue;
+  const rec = message as Record<string, unknown>;
+  if (rec.role !== "system") continue;
+  segments.push(...contentSegments(rec));
+ }
+ if (segments.length > 0) return segments;
+ const added: Record<string, unknown> = { role: "system", content: "" };
+ messages.unshift(added);
+ return [stringSegment(added, "content")];
+}
+
+/** Anthropic Messages system prompt: `system` is a string or a text-block array. */
+function messagesSystemSegments(body: Record<string, unknown>): SystemText[] {
+ const system = body.system;
+ if (Array.isArray(system)) {
+  const segments = textBlockSegments(system);
+  if (segments.length > 0) return segments;
+  const block: Record<string, unknown> = { type: "text", text: "" };
+  system.push(block);
+  return [stringSegment(block, "text")];
+ }
+ if (typeof system !== "string") body.system = "";
+ return [stringSegment(body, "system")];
+}
+
+/**
+ * Responses system prompt: `instructions`, or the `system` / `developer` items
+ * a host seats in `input[]` instead. Real OpenCode clients send `instructions`,
+ * so a host that sends neither gets one.
+ */
+function responsesSystemSegments(body: Record<string, unknown>): SystemText[] {
+ if (typeof body.instructions === "string") return [stringSegment(body, "instructions")];
+ const input = body.input;
+ if (Array.isArray(input)) {
+  const segments: SystemText[] = [];
+  for (const item of input) {
+   if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+   const rec = item as Record<string, unknown>;
+   if (rec.role !== "system" && rec.role !== "developer") continue;
+   if (typeof rec.content !== "string") continue;
+   segments.push(stringSegment(rec, "content"));
+  }
+  if (segments.length > 0) return segments;
+ }
+ body.instructions = "";
+ return [stringSegment(body, "instructions")];
+}
+
+/**
+ * Every complete env block in the system text, in wire order. Upstream reads
+ * only the FIRST pair, which is why order decides whether a request passes.
+ */
+function envBlocks(segments: SystemText[]): Array<{ segment: number; start: number; end: number; body: string }> {
+ const blocks: Array<{ segment: number; start: number; end: number; body: string }> = [];
+ segments.forEach((segment, index) => {
+  for (const match of segment.read().matchAll(ENV_PAIR_RE)) {
+   if (match.index === undefined) continue;
+   blocks.push({ segment: index, start: match.index, end: match.index + match[0].length, body: match[0] });
+  }
+ });
+ return blocks;
+}
+
+/** Drop every env block and stray tag from `text`, keeping one pair verbatim. */
+function stripEnvBlocks(text: string, keep?: { start: number; end: number }): string {
+ const strip = (part: string) => part.replace(ENV_PAIR_RE, "").replace(ENV_TAG_RE, "");
+ const result =
+  keep === undefined
+   ? strip(text)
+   : `${strip(text.slice(0, keep.start))}${text.slice(keep.start, keep.end)}${strip(text.slice(keep.end))}`;
+ return result.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/** The `Working directory:` value the caller already stated, if any. */
+function statedWorkingDirectory(segments: SystemText[]): string | null {
+ for (const segment of segments) {
+  const value = WORKING_DIRECTORY_RE.exec(segment.read())?.[1]?.trim();
+  if (value) return value;
+ }
+ return null;
+}
+
+/**
+ * Guarantee the free-tier environment gate: exactly one `<env>` … `</env>` pair
+ * in the system prompt, with `Working directory:` inside it.
+ *
+ * Measured 2026-10-24 (issues #117/#118): a body with the block answers 200 and
+ * the same body without it answers 429 FreeUsageLimitError, on the same machine
+ * within the same minute, with the retry-after countdown still hours away from
+ * 00:00 UTC. The countdown is a generic error body, not a quota window, so a
+ * host that never emits the block fails on the direct route no matter what
+ * else the lane gets right.
+ *
+ * Two measured traps decide the shape of this function:
+ * - Upstream reads only the FIRST pair in the text. A stale or partial copy
+ *   above the real block shadows it and still 429s, even though the block
+ *   itself is complete and correct. So a fix must leave exactly one pair, not
+ *   merely append one.
+ * - `Working directory:` is load-bearing. A plausible-looking block carrying
+ *   `Platform:` or `Shell:` instead is refused; a block carrying only
+ *   `Working directory:` is accepted. So an existing block without the key is
+ *   replaced rather than kept and duplicated.
+ *
+ * A host block that already satisfies both rides through byte-for-byte: the
+ * host knows its environment, this module does not. Anything else is folded
+ * into the last system message, which upstream accepts on every wire shape.
+ */
+export function ensureEnvBlock(body: Record<string, unknown>, pathname: string): void {
+ if (!body || typeof body !== "object") return;
+ const segments = pathname.endsWith("/responses")
+  ? responsesSystemSegments(body)
+  : pathname.endsWith("/messages")
+   ? messagesSystemSegments(body)
+   : chatSystemSegments(body);
+ if (segments.length === 0) return;
+ const blocks = envBlocks(segments);
+ const carrying = blocks.find((block) => WORKING_DIRECTORY_RE.test(block.body));
+ // Already the single pair upstream reads, with the key inside: leave it be.
+ if (carrying !== undefined && blocks.length === 1) return;
+ const fallback = carrying === undefined ? (statedWorkingDirectory(segments) ?? FALLBACK_WORKING_DIRECTORY) : "";
+ segments.forEach((segment, index) => {
+  segment.write(stripEnvBlocks(segment.read(), carrying !== undefined && carrying.segment === index ? carrying : undefined));
+ });
+ if (carrying !== undefined) return;
+ const last = segments[segments.length - 1];
+ const text = last.read();
+ last.write(`${text ? `${text}\n\n` : ""}<env>\n  Working directory: ${fallback}\n</env>`);
+}
+
 /**
  * Enforce the full OpenCode free-tier client fingerprint on a parsed request body.
  * Caller placeholders are lowercased (Bash -> bash),
@@ -537,6 +740,10 @@ export function enforceOpencodeFingerprint(
  if (!pathname.endsWith("/messages")) enforceAutoToolChoice(body);
  // Upstream Zen free tier mandates stream: true for all free requests
  body.stream = true;
+ // Fifth axis, body-side: a system prompt without a complete env block answers
+ // 429 FreeUsageLimitError (see ensureEnvBlock). After the shape normalization
+ // above, so the responses path edits the field upstream will actually read.
+ ensureEnvBlock(body, pathname);
 
  const caseRestore = normalizePlaceholderCase(body);
 

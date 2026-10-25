@@ -106,7 +106,9 @@ Two details worth stating precisely:
   call them. Requests without them are refused.
 
 These four axes are stated where they are enforced, at the top of
-`src/opencode-fingerprint.ts`.
+`src/opencode-fingerprint.ts`. A fifth, body-side axis refuses with `429`
+instead of `403` — see
+[the other refusal](#the-other-refusal-429-freeusagelimiterror).
 
 ### No exception
 
@@ -141,6 +143,48 @@ gone`, and `space-bunny-free` settled it by always answering. It can no longer
 settle anything, and a bare-probe `403` now proves neither hypothesis. Only a
 request that satisfies all four axes, as in the gate table above, reaches a
 model at all, so a refusal is only interpretable when it comes from that shape.
+
+## The other refusal: `429 FreeUsageLimitError`
+
+Measured 2026-10-24 (issues #117/#118). A request that satisfies all four axes
+can still be refused, and this time it looks like a spent quota:
+
+```json
+{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached. Subscribe to OpenCode Go to keep going"}}
+```
+
+It is not the quota. Same machine, same minute, same model:
+
+| System prompt | Status |
+| --- | --- |
+| `You are a coding agent.` | `429` |
+| the same, plus an `<env>` block containing `Working directory:` | **`200`** |
+| a block carrying `Platform:` / `Shell:` but no `Working directory:` | `429` |
+| only an opening tag, or only a closing tag | `429` |
+| the block in the 1st, 2nd or 3rd system message | **`200`** |
+
+Repeating the pair six times flips `200`/`429` every six requests, and the
+`retry-after` that arrives with the `429` keeps counting down to 00:00 UTC
+while requests succeed — so that countdown is a generic error body, not a
+window.
+
+Two details decide whether a block works:
+
+- **Only the first pair is read.** A stale, partial or duplicated copy above the
+  real block shadows it, and the request is refused even though the real block
+  is complete and correct. Exactly one pair must be present.
+- **`Working directory:` is load-bearing.** Any value passes, but a
+  plausible-looking block keyed `Platform:` or `Shell:` is refused.
+
+pi-freeflow repairs this on the outgoing request for every Zen wire shape —
+chat `messages[]`, Responses `instructions`, the Anthropic `system` field. A
+block the host already sent that satisfies both rules rides through untouched;
+anything else is folded into exactly one block appended to the last system
+prompt. The Kilo, Cline and OVHcloud lanes are not touched.
+
+This is separate from the relay egress refusal: a request that leaves through a
+Cloudflare/WARP-class egress is refused whatever its body says, so a relay
+`429` is not fixed by the block (see [Relays](/pages/relays)).
 
 ## What does not matter
 
