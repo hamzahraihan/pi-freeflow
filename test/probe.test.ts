@@ -181,6 +181,12 @@ test("probeRelay supports chat endpoint mode with ping payload and spoofing", as
   const parsedBody = JSON.parse(String(calledInit?.body));
   assert.equal(parsedBody.model, "nemotron-3.5-lightning-free");
   assert.equal(parsedBody.max_tokens, 1);
+  // A probe must carry the same body-side gate as real traffic: without the env
+  // block upstream answers 429 and a working relay would be graded as broken.
+  const systemText = String(parsedBody.messages[0].content);
+  assert.equal(systemText.match(/<env>[\s\S]*?<\/env>/g)?.length, 1);
+  assert.match(systemText, /Working directory:/);
+  assert.equal(parsedBody.stream, true);
  } finally {
   globalThis.fetch = realFetch;
  }
